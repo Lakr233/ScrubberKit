@@ -8,7 +8,7 @@
 import Foundation
 import SwiftSoup
 
-public enum ScrubEngine: String, CaseIterable, Codable {
+public enum ScrubEngine: String, CaseIterable, Codable, Sendable {
     case google
     case duckduckgo
     case yahoo
@@ -130,12 +130,10 @@ public enum ScrubEngine: String, CaseIterable, Codable {
 
         possibleLinks = .init(Set(possibleLinks)).sorted()
 
-        let possibleURLs = possibleLinks
+        return possibleLinks
             .compactMap { URL(string: $0) }
             .filter { $0.scheme == "http" || $0.scheme == "https" }
             .filter { !($0.host?.isEmpty ?? true) }
-
-        return possibleURLs
     }
 
     private func parse(body: Element) -> [SearchSnippet] {

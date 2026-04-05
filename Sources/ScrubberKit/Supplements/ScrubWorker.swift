@@ -5,7 +5,7 @@
 //  Created by QAQ on 2023/8/23.
 //
 
-import WebKit
+@preconcurrency import WebKit
 
 private let accessControlSourceCode = ###"""
 [
@@ -47,9 +47,121 @@ private let accessControlSourceCode = ###"""
   }
 ]
 """###
+@MainActor
 private var accessControlRule: WKContentRuleList?
 
-class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
+enum ScrubBrowserCompat {
+    static let passkeyMessageHandler = "scrubberPasskeyInterceptHandler"
+
+    static func preferredNavigationPolicy() -> WKNavigationActionPolicy {
+        #if os(iOS) || os(visionOS) || targetEnvironment(macCatalyst)
+            if let policy = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) {
+                return policy
+            }
+        #endif
+        return .allow
+    }
+
+    static func shouldLoadPopupInCurrentWebView(targetFrameIsNil: Bool) -> Bool {
+        targetFrameIsNil
+    }
+
+    static var defaultJavaScriptConfirmResult: Bool {
+        false
+    }
+
+    static var defaultJavaScriptPromptResult: String? {
+        nil
+    }
+
+    @discardableResult
+    @MainActor
+    static func installPasskeyInterceptIfSupported(on controller: WKUserContentController) -> Bool {
+        guard #available(iOS 14.0, macOS 11.0, macCatalyst 14.0, visionOS 1.0, *) else {
+            return false
+        }
+
+        controller.addUserScript(
+            WKUserScript(
+                source: passkeyPageScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false,
+                in: .page
+            )
+        )
+        controller.addUserScript(
+            WKUserScript(
+                source: passkeyRelayScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false,
+                in: .defaultClient
+            )
+        )
+        return true
+    }
+
+    @MainActor
+    static func attachPasskeyMessageHandler(
+        _ handler: WKScriptMessageHandler,
+        to controller: WKUserContentController
+    ) {
+        guard #available(iOS 14.0, macOS 11.0, macCatalyst 14.0, visionOS 1.0, *) else {
+            return
+        }
+        controller.add(handler, contentWorld: .defaultClient, name: passkeyMessageHandler)
+    }
+
+    @MainActor
+    static func removePasskeyMessageHandler(from controller: WKUserContentController) {
+        if #available(iOS 14.0, macOS 11.0, macCatalyst 14.0, visionOS 1.0, *) {
+            controller.removeScriptMessageHandler(forName: passkeyMessageHandler, contentWorld: .defaultClient)
+        } else {
+            controller.removeScriptMessageHandler(forName: passkeyMessageHandler)
+        }
+    }
+
+    static let passkeyPageScript = """
+    (function() {
+        if (navigator.credentials) {
+            var origCreate = navigator.credentials.create.bind(navigator.credentials);
+            var origGet = navigator.credentials.get.bind(navigator.credentials);
+
+            navigator.credentials.create = function(options) {
+                if (options && options.publicKey) {
+                    document.documentElement.setAttribute('data-sk-pk', Date.now().toString());
+                    return Promise.reject(new DOMException("Passkey is not supported in this browser.", "NotAllowedError"));
+                }
+                return origCreate.apply(navigator.credentials, arguments);
+            };
+
+            navigator.credentials.get = function(options) {
+                if (options && options.publicKey) {
+                    document.documentElement.setAttribute('data-sk-pk', Date.now().toString());
+                    return Promise.reject(new DOMException("Passkey is not supported in this browser.", "NotAllowedError"));
+                }
+                return origGet.apply(navigator.credentials, arguments);
+            };
+        }
+    })();
+    """
+
+    static let passkeyRelayScript = """
+    (function() {
+        function relay() {
+            if (document.documentElement.hasAttribute('data-sk-pk')) {
+                window.webkit.messageHandlers.\(passkeyMessageHandler).postMessage('detected');
+                document.documentElement.removeAttribute('data-sk-pk');
+            }
+        }
+        var observer = new MutationObserver(function() { relay(); });
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-sk-pk'] });
+        relay();
+    })();
+    """
+}
+
+@MainActor
+class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private let web = WebView()
     private let baseUrl: URL
 
@@ -59,9 +171,10 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
         let markdownDocument: String
     }
 
-    private var completion: ((ScrubResult) -> Void)?
+    private var completion: (@Sendable (ScrubResult) -> Void)?
+    private var didCleanup = false
 
-    init(baseUrl: URL, softTimeout: TimeInterval = 15, completion: @escaping (ScrubResult) -> Void) {
+    init(baseUrl: URL, softTimeout: TimeInterval = 15, completion: @escaping @Sendable (ScrubResult) -> Void) {
         self.baseUrl = baseUrl
         self.completion = completion
 
@@ -69,6 +182,7 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
 
         web.uiDelegate = self
         web.navigationDelegate = self
+        ScrubBrowserCompat.attachPasskeyMessageHandler(self, to: web.configuration.userContentController)
         let request = URLRequest(
             url: baseUrl,
             cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
@@ -77,10 +191,6 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
         web.load(request)
 
         scheduleContentReporter(delay: softTimeout)
-    }
-
-    deinit {
-        performCompletion()
     }
 
     func webView(_: WKWebView, didFinish _: WKNavigation!) {
@@ -104,7 +214,7 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
         navigationLimit -= 1
         scheduleContentReporter(delay: 5)
-        decisionHandler(.allow, .init())
+        decisionHandler(ScrubBrowserCompat.preferredNavigationPolicy(), .init())
     }
 
     func cancel() {
@@ -130,10 +240,11 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
     @objc
     private func performCompletion() {
         guard let completion else { return }
+        cleanupCompatibilityState()
         self.completion = nil
-        
+
         let web = web
-        
+
         web.evaluateJavaScript("document.documentElement.outerHTML") { data, _ in
             web.captureMarkdownContent { markdown in
                 completion(.init(
@@ -143,6 +254,58 @@ class ScrubWorker: NSObject, WKNavigationDelegate, WKUIDelegate {
                 ))
             }
         }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith _: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures _: WKWindowFeatures
+    ) -> WKWebView? {
+        guard ScrubBrowserCompat.shouldLoadPopupInCurrentWebView(targetFrameIsNil: navigationAction.targetFrame == nil) else {
+            return nil
+        }
+
+        webView.load(navigationAction.request)
+        return nil
+    }
+
+    func webView(
+        _: WKWebView,
+        runJavaScriptAlertPanelWithMessage _: String,
+        initiatedByFrame _: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable () -> Void
+    ) {
+        completionHandler()
+    }
+
+    func webView(
+        _: WKWebView,
+        runJavaScriptConfirmPanelWithMessage _: String,
+        initiatedByFrame _: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        completionHandler(ScrubBrowserCompat.defaultJavaScriptConfirmResult)
+    }
+
+    func webView(
+        _: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt _: String,
+        defaultText _: String?,
+        initiatedByFrame _: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable (String?) -> Void
+    ) {
+        completionHandler(ScrubBrowserCompat.defaultJavaScriptPromptResult)
+    }
+
+    func userContentController(_: WKUserContentController, didReceive _: WKScriptMessage) {
+        scheduleContentReporter(delay: 1)
+    }
+
+    private func cleanupCompatibilityState() {
+        guard !didCleanup else { return }
+        didCleanup = true
+        ScrubBrowserCompat.removePasskeyMessageHandler(from: web.configuration.userContentController)
     }
 }
 
@@ -157,6 +320,7 @@ private extension ScrubWorker {
             #endif
             config.allowsAirPlayForMediaPlayback = false
             config.mediaTypesRequiringUserActionForPlayback = .all
+            config.preferences.javaScriptCanOpenWindowsAutomatically = true
             config.applicationNameForUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
             config.websiteDataStore = .nonPersistent()
             if #available(iOS 17.0, macOS 14.0, *) {
@@ -165,11 +329,12 @@ private extension ScrubWorker {
             if let accessControlRule {
                 config.userContentController.add(accessControlRule)
             } else {
-                assertionFailure("accessControlRule is nil, please call setup at boot")
+                ScrubWorker.compileAccessRules()
             }
-            Turndown.setupScripts.forEach { script in
+            for script in Turndown.setupScripts {
                 config.userContentController.addUserScript(script)
             }
+            _ = ScrubBrowserCompat.installPasskeyInterceptIfSupported(on: config.userContentController)
             super.init(
                 frame: .init(x: 0, y: 0, width: 800, height: 3200),
                 configuration: config
@@ -184,12 +349,14 @@ private extension ScrubWorker {
 }
 
 extension ScrubWorker {
-    static func compileAccessRules() {
+    @MainActor
+    static func compileAccessRules(completion: (() -> Void)? = nil) {
         WKContentRuleListStore.default().compileContentRuleList(
             forIdentifier: "PlainTextAccessControlRule",
             encodedContentRuleList: accessControlSourceCode
         ) { list, _ in
             accessControlRule = list
+            completion?()
         }
     }
 }

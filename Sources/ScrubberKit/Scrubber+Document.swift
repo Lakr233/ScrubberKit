@@ -9,7 +9,7 @@ import Foundation
 import SwiftSoup
 
 extension Scrubber {
-    public struct Document {
+    public struct Document: Sendable {
         public let title: String
         public let url: URL
         public let document: String

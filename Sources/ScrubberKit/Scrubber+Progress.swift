@@ -9,13 +9,13 @@ import Combine
 import Foundation
 
 public extension Scrubber {
-    class ScrubberProgress: ObservableObject {
-        public enum EngineStatus {
+    class ScrubberProgress: ObservableObject, @unchecked Sendable {
+        public enum EngineStatus: Sendable {
             case fetching
             case completed(result: Int)
         }
 
-        public enum FetchStatus {
+        public enum FetchStatus: Sendable {
             case pending
             case fetching
             case completed
@@ -87,11 +87,11 @@ public extension Scrubber {
             ].allSatisfy(\.self)
         }
 
-        private func ensureMainThread(_ block: @escaping () -> Void) {
+        private func ensureMainThread(_ block: @escaping @Sendable () -> Void) {
             if Thread.isMainThread {
                 block()
             } else {
-                DispatchQueue.main.async { self.ensureMainThread(block) }
+                DispatchQueue.main.async(execute: block)
             }
         }
 

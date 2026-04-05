@@ -5,10 +5,10 @@
 //  Created by 秋星桥 on 2/17/25.
 //
 
-import Combine
+@preconcurrency import Combine
 import Foundation
 
-public class Scrubber {
+public class Scrubber: @unchecked Sendable {
     public let query: String
     public let options: ScrubberOptions
 
@@ -18,11 +18,13 @@ public class Scrubber {
     }
 
     private(set) var isCancelled: Bool = false
-    private var cores: [UUID: ScrubWorker] = [:]
-    private var result: [URL: Document?] = [:]
+    @MainActor private var cores: [UUID: ScrubWorker] = [:]
+    @MainActor private var result: [URL: Document?] = [:]
+    @MainActor private var runCancellables: Set<AnyCancellable> = []
 
     public var timeout: TimeInterval = 10
 
+    @MainActor
     public var documents: [Document] {
         result.values.compactMap(\.self).sorted { lhs, rhs in
             lhs.url.absoluteString < rhs.url.absoluteString
@@ -35,15 +37,18 @@ public class Scrubber {
         ProcessInfo.processInfo.processorCount * 2
     ))
     let dispatchGroup = DispatchGroup()
+    @MainActor private static var standaloneWorkers: [UUID: ScrubWorker] = [:]
 
+    @MainActor
     public func run(
         limitation: Int? = nil,
-        _ completion: @escaping ([Document]) -> Void,
-        onProgress: @escaping (Progress) -> Void = { _ in }
+        _ completion: @escaping @Sendable ([Document]) -> Void,
+        onProgress: @escaping @Sendable (Progress) -> Void = { _ in }
     ) {
         assert(Thread.isMainThread)
 
-        var cancellables: Set<AnyCancellable> = .init()
+        runCancellables.forEach { $0.cancel() }
+        runCancellables.removeAll()
         let limitation = limitation ?? 20
 
         progress.updatePublisher
@@ -52,7 +57,7 @@ public class Scrubber {
                 onProgress(progress)
                 self?.cancelIf(limitation: limitation, lastTenPercent: true)
             }
-            .store(in: &cancellables)
+            .store(in: &runCancellables)
 
         if let urlsReranker = options.urlsReranker {
             search(urlsReranker, topN: limitation)
@@ -62,9 +67,9 @@ public class Scrubber {
 
         DispatchQueue.global().async {
             _ = self.dispatchGroup.wait(timeout: .now() + 45)
-            cancellables.forEach { $0.cancel() }
-            cancellables.removeAll()
             DispatchQueue.main.async {
+                self.runCancellables.forEach { $0.cancel() }
+                self.runCancellables.removeAll()
                 self.cancel()
                 let result = self.result.compactMap(\.value)
                 let resultProgress = Progress(totalUnitCount: .init(result.count))
@@ -75,6 +80,7 @@ public class Scrubber {
         }
     }
 
+    @MainActor
     public func cancel() {
         assert(Thread.isMainThread)
         isCancelled = true
@@ -83,8 +89,12 @@ public class Scrubber {
         result = result.filter { $0.value != nil }
     }
 
+    @MainActor
     @discardableResult
-    func dispatchWorker(retrievingURL: URL, onComplete: @escaping (ScrubWorker.ScrubResult?) -> Void) -> ScrubWorker? {
+    func dispatchWorker(
+        retrievingURL: URL,
+        onComplete: @escaping @Sendable (ScrubWorker.ScrubResult?) -> Void
+    ) -> ScrubWorker? {
         assert(Thread.isMainThread)
         guard !isCancelled else {
             onComplete(nil)
@@ -99,6 +109,7 @@ public class Scrubber {
         return core
     }
 
+    @MainActor
     private func search() {
         assert(Thread.isMainThread)
         for engine in enabledEngines {
@@ -120,6 +131,7 @@ public class Scrubber {
         }
     }
 
+    @MainActor
     private func process(candidates: [URL], engine: ScrubEngine) {
         assert(Thread.isMainThread)
 
@@ -129,9 +141,10 @@ public class Scrubber {
             jobs.append(url)
             progress.update(url: url, status: .pending)
         }
+        let pendingJobs = jobs
 
         DispatchQueue.global().async {
-            for job in jobs {
+            for job in pendingJobs {
                 self.concurrentControl.wait()
                 self.dispatchGroup.enterBackground { leaver in
                     self.progress.update(url: job, status: .fetching)
@@ -144,7 +157,7 @@ public class Scrubber {
         }
     }
 
-    private func process(candidate: URL, engine: ScrubEngine, completion: @escaping () -> Void) {
+    private func process(candidate: URL, engine: ScrubEngine, completion: @escaping @Sendable () -> Void) {
         assert(!Thread.isMainThread)
         progress.update(url: candidate, status: .fetching)
         scrub(url: candidate, retry: 2) { result in
@@ -169,12 +182,14 @@ public class Scrubber {
         }
     }
 
+    @MainActor
     private func process(result: Document) {
         assert(Thread.isMainThread)
         guard !isCancelled else { return }
         self.result[result.url] = result
     }
 
+    @MainActor
     private func cancelIf(
         limitation: Int? = nil,
         lastTenPercent: Bool = false
@@ -202,18 +217,20 @@ public class Scrubber {
 }
 
 public extension Scrubber {
-    static func document(for url: URL, completion: @escaping (Document?) -> Void) {
+    @MainActor
+    static func document(for url: URL, completion: @escaping @Sendable (Document?) -> Void) {
         var completionCalled = false
-        let completion: (Document?) -> Void = { doc in
+        let finish: @MainActor @Sendable (Document?) -> Void = { doc in
             guard !completionCalled else { return }
             completionCalled = true
-            DispatchQueue.main.async { completion(doc) }
+            completion(doc)
         }
 
-        var box: ScrubWorker?
-        box = ScrubWorker(baseUrl: url, softTimeout: 15) { result in
-            _ = box
-            box = nil
+        let id = UUID()
+        let worker = ScrubWorker(baseUrl: url, softTimeout: 15) { result in
+            Task { @MainActor in
+                Self.standaloneWorkers.removeValue(forKey: id)
+            }
             DispatchQueue.global().async {
                 let doc = finalize(
                     document: result.document,
@@ -221,21 +238,27 @@ public extension Scrubber {
                     engine: nil,
                     url: result.url
                 )
-                completion(doc)
+                Task { @MainActor in
+                    finish(doc)
+                }
             }
         }
+        Self.standaloneWorkers[id] = worker
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
-            completion(nil)
+            Self.standaloneWorkers.removeValue(forKey: id)
+            finish(nil)
         }
     }
 }
 
 extension Scrubber {
+    @MainActor
     private func search(_ reranker: URLsReranker, topN: Int) {
         assert(Thread.isMainThread)
         let searchGroup = DispatchGroup()
-        var searchSnippets: [SearchSnippet] = []
+        let enabledEngines = enabledEngines
+        let searchSnippets = LockedBox<[SearchSnippet]>([])
 
         for engine in enabledEngines {
             progress.update(engine: engine, status: .fetching)
@@ -250,8 +273,9 @@ extension Scrubber {
             searchGroup.enterBackground { leaver in
                 self.scrub(url: query, retry: 2) { result in
                     let snippets = engine.parseSearchSnippet(
-                        result?.document ?? "")
-                    searchSnippets.append(contentsOf: snippets)
+                        result?.document ?? ""
+                    )
+                    searchSnippets.withLock { $0.append(contentsOf: snippets) }
                     leaver()
                 }
             }
@@ -260,7 +284,7 @@ extension Scrubber {
         dispatchGroup.enterBackground { leaver in
             searchGroup.wait()
 
-            let snippets = reranker.ranking(searchSnippets)
+            let snippets = reranker.ranking(searchSnippets.withLock { $0 })
 
             let groupedSnippets = Dictionary(
                 grouping: snippets.prefix(topN),
@@ -283,7 +307,7 @@ extension Scrubber {
                 }
             }
 
-            let missingEngines = Set(self.enabledEngines).subtracting(groupedSnippets.keys)
+            let missingEngines = Set(enabledEngines).subtracting(groupedSnippets.keys)
             for engine in missingEngines {
                 self.progress.update(engine: engine, status: .completed(result: 0))
             }
@@ -293,7 +317,8 @@ extension Scrubber {
     }
 }
 
-fileprivate extension Scrubber {
+private extension Scrubber {
+    @MainActor
     var enabledEngines: [ScrubEngine] {
         let disabledEngines = ScrubberConfiguration.disabledEngines
         return ScrubEngine.allCases.filter { engine in

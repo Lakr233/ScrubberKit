@@ -7,7 +7,7 @@
 
 import Foundation
 
-public final class URLsReranker {
+public final class URLsReranker: @unchecked Sendable {
     let freqFactor: Double
     let hostnameBoostFactor: Double
     let pathBoostFactor: Double
@@ -115,7 +115,8 @@ public final class URLsReranker {
         guard !urls.isEmpty else { return [] }
 
         let (hostnameCount, pathPrefixCount, totalUrls) = countUrlParts(
-            urls: urls)
+            urls: urls
+        )
 
         var bm25Scores: [String: Double] = [:]
         if let question {
@@ -219,7 +220,7 @@ public final class URLsReranker {
     }
 }
 
-public struct SearchSnippet {
+public struct SearchSnippet: Sendable {
     public let engine: ScrubEngine
     public let url: URL
     public let title: String?
@@ -241,7 +242,7 @@ public struct SearchSnippet {
     }
 }
 
-public struct BoostedSearchSnippet: Equatable {
+public struct BoostedSearchSnippet: Equatable, Sendable {
     public let engine: ScrubEngine
     public let url: URL
     public let title: String?
@@ -274,7 +275,7 @@ public struct BoostedSearchSnippet: Equatable {
     }
 }
 
-public struct RankOptions {
+public struct RankOptions: Sendable {
     let freqFactor: Double
     let hostnameBoostFactor: Double
     let pathBoostFactor: Double

@@ -1,19 +1,20 @@
 //
-//  TurnDown.swift
+//  Turndown.swift
 //  ScrubberKit
 //
 //  Created by qaq on 7/11/2025.
 //
 
 import Foundation
-import WebKit
 import OSLog
+import WebKit
 
 @available(iOS 14.0, macOS 11.0, *)
 let logger = Logger(subsystem: "Turndown", category: "Backend")
 
 public enum Turndown {
-    public static var setupScripts: [WKUserScript] = [
+    @MainActor
+    public static let setupScripts: [WKUserScript] = [
         "turndown",
         "turndown-webkit-lite",
     ].map { input in
@@ -29,12 +30,13 @@ public enum Turndown {
 }
 
 public extension WKWebView {
+    @MainActor
     func captureMarkdownContent(_ completion: @escaping (String) -> Void) {
         let script = """
         window.parseWithTurndown();
         """
         evaluateJavaScript(script) { data, error in
-            if let error = error {
+            if let error {
                 if #available(iOS 14.0, macOS 11.0, *) {
                     logger.error("\(error.localizedDescription)")
                 }

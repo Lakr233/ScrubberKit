@@ -8,6 +8,7 @@
 import Foundation
 import WebKit
 
+@MainActor
 public enum ScrubberConfiguration {
     public static var disabledEngines: Set<ScrubEngine> = []
 

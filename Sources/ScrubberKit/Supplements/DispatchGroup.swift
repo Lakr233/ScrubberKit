@@ -8,22 +8,27 @@
 import Foundation
 
 extension DispatchGroup {
-    typealias LeaveHandler = () -> Void
-    typealias LeaveHandlerFunc = (@escaping LeaveHandler) -> Void
+    typealias LeaveHandler = @Sendable () -> Void
+    typealias LeaveHandlerFunc = @Sendable (@escaping LeaveHandler) -> Void
 
     func enterBackground(_ leaveHandlerFunc: @escaping LeaveHandlerFunc) {
         enter()
 
         DispatchQueue.global().async {
-            var hasLeft = false
+            let hasLeft = LockedBox(false)
 
             leaveHandlerFunc {
-                guard !hasLeft else {
+                let shouldLeave = hasLeft.withLock { value in
+                    guard !value else { return false }
+                    value = true
+                    return true
+                }
+
+                guard shouldLeave else {
                     assertionFailure()
                     return
                 }
 
-                hasLeft = true
                 self.leave()
             }
         }

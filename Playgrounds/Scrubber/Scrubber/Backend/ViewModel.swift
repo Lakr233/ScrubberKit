@@ -41,7 +41,9 @@ class ViewModel: ObservableObject, Identifiable {
 
     let core: Scrubber
     let date = Date()
-    var query: String { core.query }
+    var query: String {
+        core.query
+    }
 
     @Published var documents: [Scrubber.Document]? {
         didSet { onProgressUpdate() }

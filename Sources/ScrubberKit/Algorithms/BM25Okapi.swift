@@ -84,7 +84,8 @@ class BM25Okapi {
     func calculateIDF(token: String) -> Double {
         let n = docFrequency[token] ?? 0
         return log(
-            (Double(totalDocs) - Double(n) + 0.5) / (Double(n) + 0.5) + 1)
+            (Double(totalDocs) - Double(n) + 0.5) / (Double(n) + 0.5) + 1
+        )
     }
 
     func tokenize(_ text: String) -> [String] {
