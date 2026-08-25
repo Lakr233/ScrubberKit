@@ -43,7 +43,7 @@ public extension WKWebView {
                 completion("")
             } else {
                 let document = data as? String ?? ""
-                print(document)
+                // print(document)
                 completion(document)
             }
         }

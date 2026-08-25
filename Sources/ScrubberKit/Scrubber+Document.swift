@@ -41,7 +41,7 @@ extension Scrubber {
            let build = URL(string: text)
         { newURL = build }
 
-        print("[*] result on \(newURL.absoluteString) \(title)")
+        // print("[*] result on \(newURL.absoluteString) \(title)")
 
         return .init(
             title: title,
